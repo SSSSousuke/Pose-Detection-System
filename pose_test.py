@@ -2,255 +2,248 @@ import cv2
 import mediapipe as mp
 import math 
 import time
-import requests 
+import requests
+import serial 
 
-# --- ネットワークカメラの設定 ---
+# --- 設定エリア ---
 THERMAL_SERVER_URL = "http://pigeon02.local:7878"
+ARDUINO_PORT = "/dev/tty.usbmodem1101" 
+BAUD_RATE = 9600 
 
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(
-    static_image_mode=False,
-    model_complexity=2, # 高精度モード
-    smooth_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-
-mp_drawing = mp.solutions.drawing_utils
-
-# カメラ設定 (MacのWebカメラ)
-cap = cv2.VideoCapture(1) 
-
-if not cap.isOpened():
-    print("ERROR: Could not open camera.")
-    exit()
-
-print("--- ECO Advisor System ---")
-print(f"Connecting to thermal camera at: {THERMAL_SERVER_URL}")
-
-# --- 初期設定 ---
-# ★★★ 基準値を変更したい場合はここを編集 ★★★
-user_comfortable_room_temp = 24.0
-user_baseline_skin_temp = 36.5
-
-room_temp = user_comfortable_room_temp 
-skin_temp = user_baseline_skin_temp 
-skin_temp_baseline = user_baseline_skin_temp
-
-# 判定閾値
-ROOM_TEMP_HOT = user_comfortable_room_temp + 2.0
-ROOM_TEMP_COLD = user_comfortable_room_temp - 2.0
-SKIN_TEMP_HOT = skin_temp_baseline + 0.5 
-SKIN_TEMP_COLD = skin_temp_baseline - 0.5
-
-# --- 関数定義 ---
-
-def get_thermal_data():
-    """
-    pigeon02.local から温度データを取得し、異常値を除去した上で最高温度(体温)を返す
-    """
-    try:
-        response = requests.get(THERMAL_SERVER_URL, timeout=0.5)
-        
-        if response.status_code == 200:
-            rows = response.text.strip().split('\n')
-            max_temp_raw = -99999
-            
-            for row in rows:
-                cols = row.split(',')
-                for val in cols:
-                    try:
-                        t = int(val) # データは「温度 × 100」の整数値
-                        
-                        # ★★★ 異常値フィルター ★★★
-                        # 0℃(0) 〜 60℃(6000) の範囲外は「ノイズ」として無視する
-                        if 0 <= t <= 6000: 
-                            if t > max_temp_raw:
-                                max_temp_raw = t
-                                
-                    except ValueError:
-                        continue
-            
-            if max_temp_raw > -99999:
-                return float(max_temp_raw) / 100.0
-            
-    except Exception as e:
-        pass
-    
-    return None
-
-def get_distance(p1, p2, image_width, image_height):
-    if not (p1 and p2): return float('inf') 
-    p1_x = int(p1.x * image_width); p1_y = int(p1.y * image_height)
-    p2_x = int(p2.x * image_width); p2_y = int(p2.y * image_height)
-    return math.hypot(p1_x - p2_x, p1_y - p2_y)
-
-def calculate_angle(a, b, c, image_width, image_height):
-    if not (a and b and c): return 181 
-    a_x = int(a.x * image_width); a_y = int(a.y * image_height)
-    b_x = int(b.x * image_width); b_y = int(b.y * image_height)
-    c_x = int(c.x * image_width); c_y = int(c.y * image_height)
-    ba_x = a_x - b_x; ba_y = a_y - b_y
-    bc_x = c_x - b_x; bc_y = c_y - b_y
-    angle_ba = math.atan2(ba_y, ba_x)
-    angle_bc = math.atan2(bc_y, bc_x)
-    angle_deg = abs(math.degrees(angle_bc - angle_ba))
-    if angle_deg > 180: angle_deg = 360 - angle_deg
-    return angle_deg
+# --- セットアップ ---
+print("--- ECO Advisor Personalization Setup ---")
+try:
+    print("Default: Room=24.0, Skin=33.5")
+    user_comfortable_room_temp = float(input("Enter comfortable room temp: ") or 24.0)
+    user_baseline_skin_temp = float(input("Enter baseline skin temp: ") or 33.5) 
+except:
+    user_comfortable_room_temp = 24.0
+    user_baseline_skin_temp = 33.5
 
 # --- 変数初期化 ---
-prev_wrist_x_R, prev_wrist_y_R = 0, 0
-prev_wrist_x_L, prev_wrist_y_L = 0, 0
-wrist_speed_R = 0; wrist_speed_L = 0
+room_temp = user_comfortable_room_temp 
+room_humidity = 50.0
+skin_temp = user_baseline_skin_temp 
+arduino_connected = False
 
-fanning_start_time = None; fanning_duration = 1.0
-crossing_arms_start_time = None; crossing_arms_duration = 2.0
-warming_hands_start_time = None; warming_hands_duration = 2.0
-wiping_sweat_start_time = None; wiping_sweat_duration = 1.5
+# --- 計算ロジック ---
+def calculate_ptc(temp, hum):
+    try:
+        di = 0.81 * temp + 0.01 * hum * (0.99 * temp - 14.3) + 46.3
+        score = (di - 75.0) / 5.0 
+        return max(-3.0, min(3.0, score)) 
+    except: return 0.0
 
-last_thermal_update = 0
-thermal_update_interval = 1.0 # 1秒ごとに温度更新
+def calculate_itc(current_skin, base_skin):
+    diff = current_skin - base_skin
+    score = diff * 1.5 
+    return max(-3.0, min(3.0, score))
+
+# --- 描画ヘルパー関数 (縁取り付きテキスト) ---
+def draw_text(img, text, x, y, color=(255, 255, 255), scale=0.7):
+    # 黒い縁取り (太さ4)
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 4)
+    # メインの色 (太さ2)
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2)
+
+# --- デバイス設定 ---
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose(static_image_mode=False, model_complexity=2, smooth_landmarks=True, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+mp_drawing = mp.solutions.drawing_utils
+
+cap = cv2.VideoCapture(1) 
+if not cap.isOpened(): exit()
+
+ser = None
+try:
+    ser = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=0.1)
+    arduino_connected = True
+except: print("Arduino not found.")
+
+# --- センサー関数 ---
+def get_thermal_data():
+    try:
+        response = requests.get(THERMAL_SERVER_URL, timeout=0.5)
+        if response.status_code == 200:
+            rows = response.text.strip().split('\n')
+            max_temp = -999
+            for row in rows:
+                for val in row.split(','):
+                    try:
+                        t = int(val)
+                        if 0 <= t <= 6000 and t > max_temp: max_temp = t
+                    except: continue
+            if max_temp > -999: return float(max_temp) / 100.0
+    except: pass
+    return None
+
+def read_arduino():
+    global room_temp, room_humidity, arduino_connected
+    if ser and ser.in_waiting > 0:
+        try:
+            while ser.in_waiting > 0:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if "Temp =" in line: room_temp = float(line.split()[2]); arduino_connected = True
+                elif "Humidity =" in line: room_humidity = float(line.split()[2])
+        except: pass
+
+def get_dist(p1, p2, w, h):
+    if not (p1 and p2): return 9999
+    return math.hypot(p1.x*w - p2.x*w, p1.y*h - p2.y*h)
+
+def get_angle(a, b, c, w, h):
+    if not (a and b and c): return 180
+    deg = abs(math.degrees(math.atan2(c.y*h-b.y*h, c.x*w-b.x*w) - math.atan2(a.y*h-b.y*h, a.x*w-b.x*w)))
+    return 360-deg if deg>180 else deg
+
+# --- ループ変数 ---
+prev_R, prev_L = (0,0), (0,0)
+spd_R, spd_L = 0, 0
+timers = {"fan":None, "arm":None, "warm":None, "wipe":None}
+durs = {"fan":1.0, "arm":2.0, "warm":2.0, "wipe":1.5}
+last_therm = 0
 
 while cap.isOpened():
-    success, image = cap.read()
+    success, img = cap.read()
     if not success: break
+    img = cv2.flip(img, 1)
+    h, w, _ = img.shape
+    
+    # センサー更新
+    read_arduino()
+    if time.time() - last_therm > 1.0:
+        val = get_thermal_data()
+        if val: skin_temp = val
+        last_therm = time.time()
 
-    image = cv2.flip(image, 1)
-    h, w, _ = image.shape
-    image.flags.writeable = False
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = pose.process(image)
-    image.flags.writeable = True
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    # スコア計算
+    ptc = calculate_ptc(room_temp, room_humidity)
+    itc = calculate_itc(skin_temp, user_baseline_skin_temp)
 
-    # --- 温度データの更新 ---
-    if time.time() - last_thermal_update > thermal_update_interval:
-        new_skin_temp = get_thermal_data()
-        if new_skin_temp is not None:
-            skin_temp = new_skin_temp 
-        last_thermal_update = time.time()
-
-    current_action_status = "---" 
-    action_status_display = "---" 
-    advisor_status = "---" 
-
+    # 動作検出
+    act_status = "---"
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    results = pose.process(img_rgb)
+    
     if results.pose_landmarks:
-        landmarks = results.pose_landmarks.landmark
-        def get_lm(enum): return landmarks[enum.value] if landmarks[enum.value].visibility > 0.6 else None
+        lm = results.pose_landmarks.landmark
+        def get(e): return lm[e.value] if lm[e.value].visibility > 0.6 else None
         
-        nose = get_lm(mp_pose.PoseLandmark.NOSE)
-        r_sho = get_lm(mp_pose.PoseLandmark.RIGHT_SHOULDER); l_sho = get_lm(mp_pose.PoseLandmark.LEFT_SHOULDER)
-        r_elb = get_lm(mp_pose.PoseLandmark.RIGHT_ELBOW); l_elb = get_lm(mp_pose.PoseLandmark.LEFT_ELBOW)
-        r_wri = get_lm(mp_pose.PoseLandmark.RIGHT_WRIST); l_wri = get_lm(mp_pose.PoseLandmark.LEFT_WRIST)
-        l_eye = get_lm(mp_pose.PoseLandmark.LEFT_EYE); r_eye = get_lm(mp_pose.PoseLandmark.RIGHT_EYE)
+        nose = get(mp_pose.PoseLandmark.NOSE)
+        rs, ls = get(mp_pose.PoseLandmark.RIGHT_SHOULDER), get(mp_pose.PoseLandmark.LEFT_SHOULDER)
+        re, le = get(mp_pose.PoseLandmark.RIGHT_ELBOW), get(mp_pose.PoseLandmark.LEFT_ELBOW)
+        rw, lw = get(mp_pose.PoseLandmark.RIGHT_WRIST), get(mp_pose.PoseLandmark.LEFT_WRIST)
+        leye, reye = get(mp_pose.PoseLandmark.LEFT_EYE), get(mp_pose.PoseLandmark.RIGHT_EYE)
 
-        # 速度計算
-        if r_wri:
-            curr_Rx, curr_Ry = int(r_wri.x * w), int(r_wri.y * h)
-            if prev_wrist_x_R != 0: wrist_speed_R = math.hypot(curr_Rx - prev_wrist_x_R, curr_Ry - prev_wrist_y_R)
-            prev_wrist_x_R, prev_wrist_y_R = curr_Rx, curr_Ry
-        if l_wri:
-            curr_Lx, curr_Ly = int(l_wri.x * w), int(l_wri.y * h)
-            if prev_wrist_x_L != 0: wrist_speed_L = math.hypot(curr_Lx - prev_wrist_x_L, curr_Ly - prev_wrist_y_L)
-            prev_wrist_x_L, prev_wrist_y_L = curr_Lx, curr_Ly
+        # 速度
+        if rw:
+            curr_R = (int(rw.x*w), int(rw.y*h))
+            if prev_R != (0,0): spd_R = math.hypot(curr_R[0]-prev_R[0], curr_R[1]-prev_R[1])
+            prev_R = curr_R
+        if lw:
+            curr_L = (int(lw.x*w), int(lw.y*h))
+            if prev_L != (0,0): spd_L = math.hypot(curr_L[0]-prev_L[0], curr_L[1]-prev_L[1])
+            prev_L = curr_L
 
-        # --- 1. 腕組み ---
-        if all([r_sho, l_sho, r_elb, l_elb, r_wri, l_wri]):
-            sw = get_distance(r_sho, l_sho, w, h)
-            if get_distance(r_wri, l_elb, w, h) < sw * 0.55 and get_distance(l_wri, r_elb, w, h) < sw * 0.55:
-                current_action_status = "Crossing Arms (COLD)"
-                crossing_arms_start_time = time.time()
-        
-        if crossing_arms_start_time and time.time() - crossing_arms_start_time < crossing_arms_duration:
-            current_action_status = "Crossing Arms (COLD)"
-        else: crossing_arms_start_time = None
-
-        # --- 2. 手を温める ---
-        if current_action_status == "---" and all([nose, r_wri, l_wri]):
-            dist_R = get_distance(nose, r_wri, w, h); dist_L = get_distance(nose, l_wri, w, h)
-            if dist_R < 300 and dist_L < 300 and (r_wri.z < nose.z) and (l_wri.z < nose.z):
-                current_action_status = "Warming Hands (COLD)"
-                warming_hands_start_time = time.time()
-
-        if warming_hands_start_time and time.time() - warming_hands_start_time < warming_hands_duration:
-            current_action_status = "Warming Hands (COLD)"
-        else: warming_hands_start_time = None
-
-        # --- 3. 汗を拭う ---
-        if current_action_status == "---":
+        now = time.time()
+        # 1. 腕組み
+        if all([rs, ls, re, le, rw, lw]):
+            sw = get_dist(rs, ls, w, h)
+            if get_dist(rw, le, w, h) < sw*0.55 and get_dist(lw, re, w, h) < sw*0.55:
+                act_status = "Crossing Arms (COLD)"; timers["arm"] = now
+        # 2. 手を温める
+        if act_status == "---" and all([nose, rw, lw]):
+            if get_dist(nose, rw, w, h) < 300 and get_dist(nose, lw, w, h) < 300 and rw.z < nose.z and lw.z < nose.z:
+                act_status = "Warming Hands (COLD)"; timers["warm"] = now
+        # 3. 汗拭き
+        if act_status == "---":
             is_wipe = False
-            if all([r_wri, l_eye, r_eye]):
-                y_chk = r_wri.y * h < (l_eye.y + r_eye.y)/2 * h
-                x_chk = min(l_eye.x, r_eye.x) * w < r_wri.x * w < max(l_eye.x, r_eye.x) * w
-                if y_chk and x_chk and wrist_speed_R > 10: is_wipe = True
-            if all([l_wri, l_eye, r_eye]) and not is_wipe:
-                y_chk = l_wri.y * h < (l_eye.y + r_eye.y)/2 * h
-                x_chk = min(l_eye.x, r_eye.x) * w < l_wri.x * w < max(l_eye.x, r_eye.x) * w
-                if y_chk and x_chk and wrist_speed_L > 10: is_wipe = True
-            
-            if is_wipe:
-                current_action_status = "Wiping Sweat (HOT)"
-                wiping_sweat_start_time = time.time()
-        
-        if wiping_sweat_start_time and time.time() - wiping_sweat_start_time < wiping_sweat_duration:
-            current_action_status = "Wiping Sweat (HOT)"
-        else: wiping_sweat_start_time = None
-
-        # --- 4. あおぐ ---
-        if current_action_status == "---":
+            if all([rw, leye, reye]) and rw.y < (leye.y+reye.y)/2 and spd_R > 10: is_wipe = True
+            if all([lw, leye, reye]) and lw.y < (leye.y+reye.y)/2 and spd_L > 10: is_wipe = True
+            if is_wipe: act_status = "Wiping Sweat (HOT)"; timers["wipe"] = now
+        # 4. あおぐ
+        if act_status == "---":
             is_fan = False
-            if all([nose, r_sho, r_elb, r_wri]):
-                if calculate_angle(r_sho, r_elb, r_wri, w, h) < 140 and wrist_speed_R > 35 and get_distance(nose, r_wri, w, h) < 850: is_fan = True
-            if all([nose, l_sho, l_elb, l_wri]) and not is_fan:
-                if calculate_angle(l_sho, l_elb, l_wri, w, h) < 140 and wrist_speed_L > 35 and get_distance(nose, l_wri, w, h) < 850: is_fan = True
+            if all([nose, rs, re, rw]) and get_angle(rs, re, rw, w, h)<140 and spd_R>35 and get_dist(nose, rw, w, h)<850: is_fan = True
+            if all([nose, ls, le, lw]) and get_angle(ls, le, lw, w, h)<140 and spd_L>35 and get_dist(nose, lw, w, h)<850: is_fan = True
+            if is_fan: act_status = "Fanning (HOT)"; timers["fan"] = now
 
-            if is_fan:
-                current_action_status = "Fanning (HOT)"
-                fanning_start_time = time.time()
+        # タイマー維持
+        for k, v in timers.items():
+            if v and now - v < durs[k]:
+                if k=="fan": act_status="Fanning (HOT)"
+                elif k=="wipe": act_status="Wiping Sweat (HOT)"
+                elif k=="arm": act_status="Crossing Arms (COLD)"
+                elif k=="warm": act_status="Warming Hands (COLD)"
+                break
+            else: timers[k] = None
 
-        if fanning_start_time and time.time() - fanning_start_time < fanning_duration:
-            current_action_status = "Fanning (HOT)"
-        else: fanning_start_time = None
+        mp_drawing.draw_landmarks(img, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-        # 他のタイマーリセット
-        if current_action_status != "Fanning (HOT)": fanning_start_time = None
-        if current_action_status != "Warming Hands (COLD)": warming_hands_start_time = None
-        if current_action_status != "Crossing Arms (COLD)": crossing_arms_start_time = None
-        if current_action_status != "Wiping Sweat (HOT)": wiping_sweat_start_time = None
+    # --- 判定 ---
+    is_act_hot = 1 if act_status in ["Fanning (HOT)", "Wiping Sweat (HOT)"] else 0
+    is_itc_hot = 1 if itc > 1.0 else 0
+    is_ptc_hot = 1 if ptc > 1.5 else 0
 
-        action_status_display = current_action_status
-        mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+    is_act_cold = 1 if act_status in ["Crossing Arms (COLD)", "Warming Hands (COLD)"] else 0
+    is_itc_cold = 1 if itc < -1.0 else 0
+    is_ptc_cold = 1 if ptc < -1.5 else 0
 
-    # --- ECO Advisor 判定 ---
-    if room_temp > ROOM_TEMP_HOT and skin_temp > SKIN_TEMP_HOT:
-        if action_status_display in ["Fanning (HOT)", "Wiping Sweat (HOT)"]:
-            advisor_status = "ALERT: Turn down AC (High Confidence)"
-        elif action_status_display in ["Crossing Arms (COLD)", "Warming Hands (COLD)"]:
-            advisor_status = "WARNING: Contradiction!"
-        else:
-            advisor_status = "User seems hot (Low Confidence)"
-    elif room_temp < ROOM_TEMP_COLD and skin_temp < SKIN_TEMP_COLD:
-        if action_status_display in ["Crossing Arms (COLD)", "Warming Hands (COLD)"]:
-            advisor_status = "ALERT: Turn on Heater! (High Confidence)"
-        elif action_status_display in ["Fanning (HOT)", "Wiping Sweat (HOT)"]:
-             advisor_status = "WARNING: Contradiction!"
-        else:
-            advisor_status = "User seems cold (Low Confidence)"
-    else:
-        if action_status_display in ["Fanning (HOT)", "Wiping Sweat (HOT)"]:
-            advisor_status = "User seems hot (Low Confidence)"
-        elif action_status_display in ["Crossing Arms (COLD)", "Warming Hands (COLD)"]:
-            advisor_status = "User seems cold (Low Confidence)"
-        else:
-            advisor_status = "OK: Comfortable"
+    hot_score = is_act_hot + is_itc_hot + is_ptc_hot
+    cold_score = is_act_cold + is_itc_cold + is_ptc_cold
 
-    # 表示
-    cv2.putText(image, f'Room Temp: {room_temp:.1f} C', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-    cv2.putText(image, f'Skin Temp (Net): {skin_temp:.1f} C', (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-    cv2.putText(image, f'Action: {action_status_display}', (10, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    cv2.putText(image, f'Advisor: {advisor_status}', (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    msg = "Feeling Comfortable"
+    conf = ""
+    bg_col = (0, 200, 0) # 緑
 
-    cv2.imshow('ECO Advisor System', image)
+    if hot_score >= 2:
+        msg = "Feeling Hot"
+        conf = "(High Confidence)"
+        bg_col = (0, 0, 255) # 赤
+    elif hot_score == 1:
+        msg = "Feeling Hot"
+        if is_act_hot: conf = "(Med: Action)"
+        elif is_itc_hot: conf = "(Med: Skin)"
+        else: conf = "(Low: Room)"
+        bg_col = (0, 165, 255) # オレンジ
+    elif cold_score >= 2:
+        msg = "Feeling Cold"
+        conf = "(High Confidence)"
+        bg_col = (255, 0, 0) # 青
+    elif cold_score == 1:
+        msg = "Feeling Cold"
+        if is_act_cold: conf = "(Med: Action)"
+        elif is_itc_cold: conf = "(Med: Skin)"
+        else: conf = "(Low: Room)"
+        bg_col = (255, 255, 0) # 水色
+    if hot_score > 0 and cold_score > 0:
+        msg = "Contradiction!"
+        conf = ""
+        bg_col = (128, 0, 128) # 紫
+
+    # --- 描画 (見やすく改良) ---
+    
+    # 色の決定 (暑い=赤, 寒い=青, 普通=白)
+    col_ptc = (0, 0, 255) if ptc > 0.5 else (255, 0, 0) if ptc < -0.5 else (255, 255, 255)
+    col_itc = (0, 0, 255) if itc > 0.5 else (255, 0, 0) if itc < -0.5 else (255, 255, 255)
+    col_act = (0, 0, 255) if "HOT" in act_status else (255, 0, 0) if "COLD" in act_status else (255, 255, 255)
+
+    ard_stat = "" if arduino_connected else "(Disc.)"
+    
+    # 情報表示 (黒縁取り付きで表示)
+    draw_text(img, f'Room: {room_temp:.1f}C / {room_humidity:.0f}% {ard_stat}', 20, 40)
+    draw_text(img, f'Skin: {skin_temp:.1f} C', 20, 80)
+    
+    draw_text(img, f'PTC (Env): {ptc:+.1f}', 20, 130, col_ptc)
+    draw_text(img, f'ITC (Body): {itc:+.1f}', 20, 170, col_itc)
+    draw_text(img, f'Action: {act_status}', 20, 220, col_act)
+
+    # 判定バー
+    cv2.rectangle(img, (0, h-80), (w, h), bg_col, -1)
+    cv2.putText(img, msg, (20, h-40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255,255,255), 3)
+    cv2.putText(img, conf, (20, h-15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 1)
+
+    cv2.imshow('ECO Advisor', img)
     if cv2.waitKey(5) & 0xFF == ord('q'): break
 
 cap.release()
